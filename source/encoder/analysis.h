@@ -192,6 +192,10 @@ protected:
     bool recursionDepthCheck(const CUData& parentCTU, const CUGeom& cuGeom, const Mode& bestMode);
     bool complexityCheckCU(const Mode& bestMode);
 
+    /* neural-network CU split predictor (--rskip 3 / NN_BASED_RSKIP) */
+    bool nnSkipRecursion(const CUData& parentCTU, const CUGeom& cuGeom,
+                         const Mode& bestMode, uint32_t minDepth);
+
     /* generate residual and recon pixels for an entire CTU recursively (RD0) */
     void encodeResidue(const CUData& parentCTU, const CUGeom& cuGeom);
 

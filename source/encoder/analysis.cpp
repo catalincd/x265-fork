@@ -33,6 +33,7 @@
 #include "analysis.h"
 #include "rdcost.h"
 #include "encoder.h"
+#include "cunn.h"
 
 using namespace X265_NS;
 
@@ -115,6 +116,46 @@ bool Analysis::create(ThreadLocalData *tld)
     }
     if (m_param->sourceHeight >= 1080)
         m_bHD = true;
+
+    /* One-time NN initialisation (benign race: all threads set the same values). */
+    static bool s_cunnInitDone = false;
+    if (!s_cunnInitDone)
+    {
+        s_cunnInitDone = true;
+
+        /* Load trained weights if available. */
+        const char* weightsPath = getenv("X265_NN_WEIGHTS");
+        if (weightsPath)
+        {
+            if (cunnLoadWeights(weightsPath))
+                x265_log(m_param, X265_LOG_INFO,
+                         "CU-NN: loaded weights from %s\n", weightsPath);
+            else
+                x265_log(m_param, X265_LOG_WARNING,
+                         "CU-NN: failed to load '%s', using default weights\n",
+                         weightsPath);
+        }
+
+#ifdef X265_CUNN_COLLECT
+        /* Open the training-data log (requires -DX265_CUNN_COLLECT at build time). */
+        const char* logPath = getenv("X265_CUNN_LOG");
+        if (logPath)
+        {
+            s_cunnLogFile = fopen(logPath, "w");
+            if (s_cunnLogFile)
+            {
+                fprintf(s_cunnLogFile,
+                        "cu_variance,depth,qp,slice_type,luma_mean,mad,"
+                        "min_temp_depth,sa8d_cost,split\n");
+                x265_log(m_param, X265_LOG_INFO,
+                         "CU-NN: collecting training data to %s\n", logPath);
+            }
+            else
+                x265_log(m_param, X265_LOG_WARNING,
+                         "CU-NN: cannot open log file '%s'\n", logPath);
+        }
+#endif
+    }
 
     return ok;
 }
@@ -1330,6 +1371,10 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
                 {
                     skipRecursion = complexityCheckCU(*md.bestMode);
                 }
+                else if (m_param->recursionSkipMode == NN_BASED_RSKIP)
+                {
+                    skipRecursion = nnSkipRecursion(parentCTU, cuGeom, *md.bestMode, minDepth);
+                }
 
             }
         }
@@ -1793,6 +1838,43 @@ SplitData Analysis::compressInterCU_rd0_4(const CUData& parentCTU, const CUGeom&
         if (m_param->rdLevel)
             md.bestMode->reconYuv.copyToPicYuv(reconPic, cuAddr, cuGeom.absPartIdx);
 
+#ifdef X265_CUNN_COLLECT
+        /* Log one training sample when both split and no-split were candidates.
+         * Run with --rskip 0 for unbiased ground-truth labels. */
+        if (mightNotSplit && mightSplit && md.bestMode)
+        {
+            uint32_t csz  = md.bestMode->fencYuv->m_size;
+            const pixel* csrc = md.bestMode->fencYuv->m_buf[0];
+            uint32_t psum = 0;
+            for (uint32_t y = 0; y < csz; y++)
+                for (uint32_t x = 0; x < csz; x++)
+                    psum += csrc[y * csz + x];
+            uint32_t cnpix = csz * csz;
+            uint32_t cmean = psum / cnpix;
+            uint32_t msum  = 0;
+            uint64_t sqsum = 0;
+            for (uint32_t y = 0; y < csz; y++)
+                for (uint32_t x = 0; x < csz; x++)
+                {
+                    int d = (int)csrc[y * csz + x] - (int)cmean;
+                    msum  += (uint32_t)(d < 0 ? -d : d);
+                    sqsum += (uint64_t)((int64_t)d * d);
+                }
+            uint32_t cvar = (uint32_t)(sqsum / cnpix);
+            uint64_t raw[8] = {
+                (uint64_t)cvar,
+                (uint64_t)cuGeom.depth,
+                (uint64_t)(uint32_t)parentCTU.m_qp[0],
+                (uint64_t)m_slice->m_sliceType,
+                (uint64_t)cmean,
+                (uint64_t)(msum / (csz * csz)),
+                (uint64_t)minDepth,
+                (uint64_t)md.bestMode->sa8dCost,
+            };
+            cunnLogCU(raw, md.bestMode == &md.pred[PRED_SPLIT] ? 1 : 0);
+        }
+#endif
+
         if ((m_limitTU & X265_TU_LIMIT_NEIGH) && cuGeom.log2CUSize >= 4)
         {
             if (mightNotSplit)
@@ -2027,6 +2109,8 @@ SplitData Analysis::compressInterCU_rd5_6(const CUData& parentCTU, const CUGeom&
                 skipRecursion = md.bestMode && !md.bestMode->cu.getQtRootCbf(0);
             else if (cuGeom.log2CUSize >= MAX_LOG2_CU_SIZE - 1 && m_param->recursionSkipMode == EDGE_BASED_RSKIP)
                 skipRecursion = md.bestMode && complexityCheckCU(*md.bestMode);
+            else if (m_param->recursionSkipMode == NN_BASED_RSKIP && md.bestMode)
+                skipRecursion = nnSkipRecursion(parentCTU, cuGeom, *md.bestMode, 0);
         }
         if (m_param->bAnalysisType == AVC_INFO && md.bestMode && cuGeom.numPartitions <= 16 && m_param->analysisLoadReuseLevel == 7)
             skipRecursion = true;
@@ -3425,6 +3509,72 @@ void Analysis::addSplitFlagCost(Mode& mode, uint32_t depth)
     }
 }
 
+/* nnSkipRecursion — run the MLP to predict whether this CU should skip
+ * further quad-tree splitting.  Returns true → caller sets skipRecursion.
+ *
+ * Called when m_param->recursionSkipMode == NN_BASED_RSKIP and the best
+ * mode so far is not already a skip/merge early-exit.
+ *
+ * Feature layout matches cunn.h exactly (see header for definitions). */
+bool Analysis::nnSkipRecursion(const CUData& parentCTU, const CUGeom& cuGeom,
+                                const Mode& bestMode, uint32_t minDepth)
+{
+    float features[CUNN_INPUTS];
+
+    /* [1] CU depth (0 = 64x64 … 3 = 8x8) */
+    features[1] = (float)cuGeom.depth / 3.f;
+
+    /* [2] QP, normalised to [0, 1] over the typical range 12-51 */
+    float fqp = ((float)parentCTU.m_qp[0] - 12.f) / 39.f;
+    features[2] = fqp < 0.f ? 0.f : (fqp > 1.f ? 1.f : fqp);
+
+    /* [3] Slice type: I = 0.0, P = 0.5, B = 1.0 */
+    features[3] = (float)m_slice->m_sliceType / 2.f;
+
+    /* [4] Mean luma, [5] MAD/mean ratio, [0] pixel variance —
+     * computed from the fenc luma buffer directly so they are always
+     * valid regardless of whether bDynamicRefine/bEnableFades is set. */
+    uint32_t cuSize = bestMode.fencYuv->m_size;
+    const pixel* src = bestMode.fencYuv->m_buf[0];
+    uint32_t numPix = cuSize * cuSize;
+
+    uint32_t pixSum = 0;
+    for (uint32_t y = 0; y < cuSize; y++)
+        for (uint32_t x = 0; x < cuSize; x++)
+            pixSum += src[y * cuSize + x];
+    uint32_t meanVal = pixSum / numPix;
+
+    uint32_t madSum = 0;
+    uint64_t sqDiffSum = 0;
+    for (uint32_t y = 0; y < cuSize; y++)
+        for (uint32_t x = 0; x < cuSize; x++)
+        {
+            int d = (int)src[y * cuSize + x] - (int)meanVal;
+            madSum   += (uint32_t)(d < 0 ? -d : d);
+            sqDiffSum += (uint64_t)((int64_t)d * d);
+        }
+    uint32_t mad        = madSum / numPix;
+    uint32_t pixVariance = (uint32_t)(sqDiffSum / numPix);
+
+    /* [0] pixel variance, normalised */
+    features[0] = pixVariance < 5000u ? (float)pixVariance / 5000.f : 1.f;
+
+    float maxPix = (float)((1 << X265_DEPTH) - 1);
+    features[4] = (float)meanVal / maxPix;
+    features[5] = (float)mad / (float)(meanVal + 1u);
+
+    /* [6] Min depth observed in co-located reference CTU(s) */
+    float ftd = (float)minDepth / 3.f;
+    features[6] = ftd > 1.f ? 1.f : ftd;
+
+    /* [7] Log-normalised SA8D cost of the best candidate so far */
+    float sa8d = (float)bestMode.sa8dCost;
+    float fsa  = logf(1.f + sa8d) / 30.f;
+    features[7] = fsa > 1.f ? 1.f : fsa;
+
+    return cunnPredict(features) > 0.25f;
+}
+
 uint32_t Analysis::topSkipMinDepth(const CUData& parentCTU, const CUGeom& cuGeom)
 {
     /* Do not attempt to code a block larger than the largest block in the
@@ -3581,6 +3731,11 @@ uint32_t Analysis::calculateCUVariance(const CUData& ctu, const CUGeom& cuGeom)
 {
     uint32_t cuVariance = 0;
     uint32_t *blockVariance = m_frame->m_lowres.blockVariance;
+    /* blockVariance is only allocated when AQ/dynamic-refine is active.
+     * Return 0 when it is absent so callers (including NN collect/infer)
+     * that run outside those modes do not dereference a null pointer.    */
+    if (!blockVariance)
+        return 0;
     int loopIncr = (m_param->rc.qgSize == 8) ? 8 : 16;
 
     uint32_t width = m_frame->m_fencPic->m_picWidth;

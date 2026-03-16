@@ -1,0 +1,4 @@
+build/
+xbuild/
+tools/env
+*.bin

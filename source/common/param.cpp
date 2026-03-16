@@ -1611,8 +1611,8 @@ int x265_check_params(x265_param* param)
           "RDOQ Level is out of range");
     CHECK(param->dynamicRd < 0 || param->dynamicRd > x265_ADAPT_RD_STRENGTH,
           "Dynamic RD strength must be between 0 and 4");
-    CHECK(param->recursionSkipMode > 2 || param->recursionSkipMode < 0,
-          "Invalid Recursion skip mode. Valid modes 0,1,2");
+    CHECK(param->recursionSkipMode > 3 || param->recursionSkipMode < 0,
+          "Invalid Recursion skip mode. Valid modes 0,1,2,3");
     if (param->recursionSkipMode == EDGE_BASED_RSKIP)
     {
         CHECK(param->edgeVarThreshold < 0.0f || param->edgeVarThreshold > 1.0f,

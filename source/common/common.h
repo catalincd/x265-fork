@@ -273,7 +273,8 @@ typedef int16_t  coeff_t;      // transform coefficient
 #define MAX_TS_SIZE (1 << MAX_LOG2_TS_SIZE)
 
 #define RDCOST_BASED_RSKIP 1
-#define EDGE_BASED_RSKIP 2
+#define EDGE_BASED_RSKIP   2
+#define NN_BASED_RSKIP     3  /* neural-network CU split predictor (cunn.h) */
 
 #define COEF_REMAIN_BIN_REDUCTION   3 // indicates the level at which the VLC
                                       // transitions from Golomb-Rice to TU+EG(k)

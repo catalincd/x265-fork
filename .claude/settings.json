@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import matplotlib; import numpy; print\\(''ok''\\)\")",
+      "Bash(python3 tools/cu_diagram.py)"
+    ]
+  }
+}
